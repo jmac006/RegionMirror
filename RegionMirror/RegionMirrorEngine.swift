@@ -23,6 +23,19 @@ extension NSScreen {
     var displayID: CGDirectDisplayID {
         deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as! CGDirectDisplayID
     }
+    /// Pixel scale factors (pixels per point) derived from CoreGraphics for this screen.
+    /// More robust than `backingScaleFactor` when different displays are attached.
+    var pixelScale: (sx: CGFloat, sy: CGFloat) {
+        let did = self.displayID
+        let pw = CGFloat(CGDisplayPixelsWide(did))
+        let ph = CGFloat(CGDisplayPixelsHigh(did))
+        // `frame` is in points
+        let sw = self.frame.width
+        let sh = self.frame.height
+        let sx = pw / max(sw, 1)
+        let sy = ph / max(sh, 1)
+        return (sx, sy)
+    }
 }
 
 /// Snap a rect in *points* so its edges fall exactly on device pixels for a given scale.
@@ -32,6 +45,14 @@ extension CGRect {
         let y = round(self.origin.y * scale) / scale
         let w = round(self.size.width * scale) / scale
         let h = round(self.size.height * scale) / scale
+        return CGRect(x: x, y: y, width: w, height: h)
+    }
+    /// Snap a rect in *points* with separate X/Y pixel scales.
+    func snappedToDevicePixels(scaleX: CGFloat, scaleY: CGFloat) -> CGRect {
+        let x = round(self.origin.x * scaleX) / scaleX
+        let y = round(self.origin.y * scaleY) / scaleY
+        let w = round(self.size.width * scaleX) / scaleX
+        let h = round(self.size.height * scaleY) / scaleY
         return CGRect(x: x, y: y, width: w, height: h)
     }
 }
@@ -47,10 +68,15 @@ final class SelectionOverlayWindow: NSWindow {
     private var startPoint: NSPoint?
     private var shapeLayer: CAShapeLayer?
     private let targetScale: CGFloat
+    private let targetScaleX: CGFloat
+    private let targetScaleY: CGFloat
     var onSelectionComplete: ((CGRect) -> Void)?
 
     init(on screen: NSScreen) {
         self.targetScale = screen.backingScaleFactor
+        let s = screen.pixelScale
+        self.targetScaleX = s.sx
+        self.targetScaleY = s.sy
         super.init(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
         isOpaque = false
         backgroundColor = NSColor.black.withAlphaComponent(0.25) // visible & receives events
@@ -87,7 +113,7 @@ final class SelectionOverlayWindow: NSWindow {
         var rect = CGRect(x: min(sp.x, p.x), y: min(sp.y, p.y),
                           width: abs(sp.x - p.x), height: abs(sp.y - p.y))
         if rect.width > 10 && rect.height > 10 {
-            rect = rect.snappedToDevicePixels(scale: targetScale)
+            rect = rect.snappedToDevicePixels(scaleX: targetScaleX, scaleY: targetScaleY)
             onSelectionComplete?(rect)
         }
         close()
@@ -175,20 +201,25 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
 
     @MainActor
     func startCapture(for scDisplay: SCDisplay, on screen: NSScreen, region: CGRect, excludingApplications: [SCRunningApplication]) async {
-        let scale = screen.backingScaleFactor
-        let x_px = Int(round(region.origin.x * scale))
-        let y_px = Int(round((screen.frame.height - region.origin.y - region.height) * scale)) // flip Y
-        let w_px = max(16, Int(round(region.width * scale)))
-        let h_px = max(16, Int(round(region.height * scale)))
+        let (sx, sy) = screen.pixelScale
+
+        // Convert the selection (points) to integer pixels relative to the display,
+        // flipping Y because ScreenCaptureKit uses a top-left origin in pixel space.
+        let x_px = Int(round(region.origin.x * sx))
+        let y_px = Int(round((screen.frame.height - region.origin.y - region.height) * sy))
+        let w_px = max(16, Int(round(region.size.width * sx)))
+        let h_px = max(16, Int(round(region.size.height * sy)))
         let pixelRect = CGRect(x: x_px, y: y_px, width: w_px, height: h_px)
 
-        let sizePoints = NSSize(width: CGFloat(w_px) / scale, height: CGFloat(h_px) / scale)
-        setContentSize(sizePoints)
-        contentAspectRatio = sizePoints
-        applyScaleFromCurrentScreen()
+        // Size the content so 1 captured pixel == 1 device pixel on this screen
+        let sizePoints = NSSize(width: CGFloat(w_px) / sx, height: CGFloat(h_px) / sy)
+        self.setContentSize(sizePoints)
+        self.contentAspectRatio = sizePoints
+        self.contentResizeIncrements = NSSize(width: 1 / sx, height: 1 / sy)
+        self.applyScaleFromCurrentScreen()
 
         let cfg = SCStreamConfiguration()
-        cfg.width = w_px
+        cfg.width  = w_px
         cfg.height = h_px
         cfg.showsCursor = true
         cfg.sourceRect = pixelRect
