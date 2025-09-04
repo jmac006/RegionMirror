@@ -27,17 +27,12 @@ No third-party packages. Uses Apple frameworks shipped with macOS:
 
 ## Installation
 
-### Option A — Xcode (recommended)
+### Xcode
 1. Clone or download the repository.
 2. Open `RegionMirror.xcodeproj` in Xcode.
 3. In **Signing & Capabilities**, set a valid team (any free Developer ID is fine for local runs).
 4. Select the **RegionMirror** scheme and press **Run**.
 
-### Option B — Command line with xcodebuild
-```bash
-xcodebuild -scheme RegionMirror -configuration Release build
-open build/Build/Products/Release/RegionMirror.app
-```
 
 Note: Building with swiftc alone is not supported for the multi-file SwiftUI project. Use Xcode or xcodebuild.
 
