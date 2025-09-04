@@ -2,8 +2,6 @@
 //  RegionMirrorEngine.swift
 //  RegionMirror
 //
-//  Created by Justin Mac on 9/3/25.
-//
 
 
 import AppKit
@@ -60,6 +58,7 @@ final class SelectionOverlayWindow: NSWindow {
         level = .screenSaver
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         hasShadow = false
+        isReleasedWhenClosed = false // Manage lifecycle manually
 
         let overlayView = NSView(frame: contentLayoutRect)
         overlayView.wantsLayer = true
@@ -210,7 +209,7 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
 
     // SCStreamOutput: Handle incoming frames
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
-        guard outputType == .screen, CMSampleBufferIsValid(sampleBuffer), self.stream != nil, !isTearingDown else { return }
+        guard outputType == .screen, !isTearingDown, CMSampleBufferIsValid(sampleBuffer), self.stream != nil else { return }
         if displayLayer.isReadyForMoreMediaData {
             displayLayer.enqueue(sampleBuffer)
         }
@@ -220,38 +219,72 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         Task { @MainActor in
             presenter?.showError("Screen capture stopped: \(error.localizedDescription)")
-            // Trigger the standard close and cleanup procedure.
             self.close()
         }
     }
     
     // NSWindowDelegate: The primary cleanup hook for the window.
     func windowWillClose(_ notification: Notification) {
-        // Prevent cleanup logic from running multiple times.
         if isTearingDown { return }
         isTearingDown = true
 
-        // Immediately stop rendering.
-        displayLayer.removeFromSuperlayer()
         displayLayer.flushAndRemoveImage()
+        displayLayer.removeFromSuperlayer()
 
-        // Safely and asynchronously stop the ScreenCaptureKit stream.
-        // The Task will retain 'self' until the stream has stopped.
         if let stream = self.stream {
             Task {
                 do {
+                    // **FIX 2**: First, remove self as an output to stop receiving frames immediately.
+                    try stream.removeStreamOutput(self, type: .screen)
+                    // Then, asynchronously stop the capture process.
                     try await stream.stopCapture()
                 } catch {
-                    print("Error stopping capture: \(error.localizedDescription)")
+                    print("Error during stream teardown: \(error.localizedDescription)")
                 }
             }
             self.stream = nil
         }
         
-        // Notify the presenter to update the app state.
         presenter?.mirrorWindowClosedByUser()
     }
 }
+
+// MARK: - Sharing Border Overlay
+
+final class BorderOverlayWindow: NSWindow {
+    private let borderLayer = CAShapeLayer()
+
+    init(region: CGRect) {
+        super.init(contentRect: region, styleMask: .borderless, backing: .buffered, defer: false)
+        isOpaque = false
+        backgroundColor = .clear
+        ignoresMouseEvents = true
+        level = .floating
+        hasShadow = false
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        isReleasedWhenClosed = false // Manage lifecycle manually
+
+        let view = NSView(frame: .zero)
+        view.wantsLayer = true
+        contentView = view
+
+        borderLayer.strokeColor = NSColor.systemBlue.withAlphaComponent(0.8).cgColor
+        borderLayer.lineWidth = 4.0
+        borderLayer.fillColor = nil
+        borderLayer.lineDashPattern = [15, 10]
+        borderLayer.path = CGPath(rect: view.bounds.insetBy(dx: 2, dy: 2), transform: nil)
+        borderLayer.frame = view.bounds
+        view.layer?.addSublayer(borderLayer)
+
+        let animation = CABasicAnimation(keyPath: "lineDashPhase")
+        animation.fromValue = 0
+        animation.toValue = borderLayer.lineDashPattern?.map { $0.doubleValue }.reduce(0, +) ?? 0
+        animation.duration = 0.75
+        animation.repeatCount = .infinity
+        borderLayer.add(animation, forKey: "lineDashPhaseAnimation")
+    }
+}
+
 
 // MARK: - Presenter (App logic for SwiftUI)
 
@@ -260,11 +293,17 @@ final class Presenter: ObservableObject {
     private var model = AppState()
     private var selectionOverlay: SelectionOverlayWindow?
     private var mirrorWindow: MirrorWindow?
+    private var borderOverlay: BorderOverlayWindow?
+
 
     func startSelection() {
         if !CGPreflightScreenCaptureAccess() {
             _ = CGRequestScreenCaptureAccess()
         }
+
+        // **FIX 1**: If a selection is already in progress, close it before starting a new one.
+        selectionOverlay?.close()
+        selectionOverlay = nil
 
         let targetScreen = NSScreen.screenUnderMouse()
         let overlay = SelectionOverlayWindow(on: targetScreen)
@@ -272,8 +311,10 @@ final class Presenter: ObservableObject {
             guard let self = self else { return }
             self.model.selectedRegion = rect
             self.startMirroring(on: targetScreen, region: rect)
+            self.selectionOverlay = nil // Clean up reference after completion
         }
-        selectionOverlay = overlay
+        self.selectionOverlay = overlay
+        
         overlay.makeKeyAndOrderFront(nil)
         overlay.orderFrontRegardless()
         NSApp.activate(ignoringOtherApps: true)
@@ -292,9 +333,15 @@ final class Presenter: ObservableObject {
                 let excludedApps = content.applications.filter { $0.bundleIdentifier == myBundleID }
 
                 self.mirrorWindow?.close()
+                self.borderOverlay?.close()
+
                 let mirror = MirrorWindow(contentRect: region, presenter: self)
                 self.mirrorWindow = mirror
                 await mirror.startCapture(for: scDisplay, on: screen, region: region, excludingApplications: excludedApps)
+
+                let border = BorderOverlayWindow(region: region)
+                self.borderOverlay = border
+                border.orderFront(nil)
 
                 self.model.isCapturing = true
             } catch {
@@ -307,8 +354,6 @@ final class Presenter: ObservableObject {
     }
 
     func stopCapture() {
-        // Programmatically close the window.
-        // Cleanup is handled by the windowWillClose delegate method.
         mirrorWindow?.close()
     }
 
@@ -322,9 +367,10 @@ final class Presenter: ObservableObject {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    // This is called by MirrorWindow's `windowWillClose` delegate method.
     func mirrorWindowClosedByUser() {
         mirrorWindow = nil
+        borderOverlay?.close()
+        borderOverlay = nil
         model.isCapturing = false
     }
     
