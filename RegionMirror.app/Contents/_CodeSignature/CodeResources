@@ -19,14 +19,23 @@
 	</dict>
 	<key>files2</key>
 	<dict>
+		<key>Frameworks/libclang_rt.asan_osx_dynamic.dylib</key>
+		<dict>
+			<key>cdhash</key>
+			<data>
+			G2EO/1hOhctewAzs82fkxnnXAAE=
+			</data>
+			<key>requirement</key>
+			<string>cdhash H"1b610eff584e85cb5ec00cecf367e4c679d70001" or cdhash H"b78d0e4f60bcd7dc370c0084d96a14338f2efc1b" or cdhash H"f1016276cf1cc3242610851acac6780767d3810d" or cdhash H"572f1b4a206325f500b79ae84409ba503ff4558c"</string>
+		</dict>
 		<key>MacOS/RegionMirror.debug.dylib</key>
 		<dict>
 			<key>cdhash</key>
 			<data>
-			1QkOOO1eZ2LHd1EW4DCGzjB4Pz8=
+			MRjNuVtPtwTO/OyAmuljHIugfBU=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"d5090e38ed5e6762c7775116e03086ce30783f3f"</string>
+			<string>cdhash H"3118cdb95b4fb704cefcec809ae9631c8ba07c15"</string>
 		</dict>
 		<key>MacOS/__preview.dylib</key>
 		<dict>
