@@ -93,9 +93,9 @@ The mirror looks blurry.
 	•	Verify the Teams share is the RegionMirror window (not the entire screen scaled by the meeting app).
 
 Tested
-	•	Hardware: Apple Silicon M2 Max
-	•	macOS: Sequoia 15.6.1
-	•	Apps: Microsoft Teams (window sharing), also verified with other conferencing apps that support window-level sharing.
+- Hardware: Apple Silicon M2 Max
+- macOS: Sequoia 15.6.1
+- Apps: Microsoft Teams (window sharing), also verified with other conferencing apps that support window-level sharing.
 
 RegionMirror/
 ├─ RegionMirror.xcodeproj
