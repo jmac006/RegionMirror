@@ -5,6 +5,7 @@
 //  Created by Justin Mac on 9/3/25.
 //
 
+
 import AppKit
 @preconcurrency import ScreenCaptureKit
 import AVFoundation
@@ -115,17 +116,18 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
     fileprivate let displayLayer = AVSampleBufferDisplayLayer()
     private var stream: SCStream?
     weak var presenter: Presenter?
+    private var isTearingDown = false
 
     init(contentRect: CGRect, presenter: Presenter) {
         self.presenter = presenter
         super.init(
             contentRect: contentRect,
-            styleMask: [.titled, .closable, .resizable, .miniaturizable], // minimizable
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         title = "RegionMirror"
-        isReleasedWhenClosed = true
+        isReleasedWhenClosed = false // Important: We manage the lifecycle to prevent early release.
         delegate = self
 
         // Host layer
@@ -133,14 +135,12 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
         contentView!.layer?.masksToBounds = true
         contentView!.layer?.allowsGroupOpacity = false
 
-        // Preview layer: pixel-perfect & unfiltered
+        // Preview layer
         displayLayer.isOpaque = true
-        displayLayer.videoGravity = .resize                 // no extra scaling
+        displayLayer.videoGravity = .resize
         displayLayer.magnificationFilter = .nearest
-        displayLayer.minificationFilter  = .nearest
+        displayLayer.minificationFilter = .nearest
         displayLayer.allowsEdgeAntialiasing = false
-
-        // Add layer
         contentView!.layer?.addSublayer(displayLayer)
 
         // Initial alignment & scale
@@ -152,7 +152,7 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
             guard let self = self, let cv = self.contentView else { return }
             self.displayLayer.frame = cv.backingAlignedRect(cv.bounds, options: .alignAllEdgesNearest)
         }
-        // Update scale if window moves to a screen with a different backing scale
+        // Update scale on screen changes
         NotificationCenter.default.addObserver(forName: NSWindow.didChangeScreenNotification, object: self, queue: .main) { [weak self] _ in
             self?.applyScaleFromCurrentScreen()
         }
@@ -165,20 +165,17 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
     }
 
     private func applyScaleFromCurrentScreen() {
-        let s = (self.screen?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor) ?? 2.0
-        self.contentView?.layer?.contentsScale = s
-        self.displayLayer.contentsScale = s
-        // Align to pixel grid
-        if let cv = self.contentView {
-            self.displayLayer.frame = cv.backingAlignedRect(cv.bounds, options: .alignAllEdgesNearest)
+        let s = (screen?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor) ?? 2.0
+        contentView?.layer?.contentsScale = s
+        displayLayer.contentsScale = s
+        if let cv = contentView {
+            displayLayer.frame = cv.backingAlignedRect(cv.bounds, options: .alignAllEdgesNearest)
         }
-        // Snap resizes to device pixels to avoid blur when the user drags the window edges
-        self.contentResizeIncrements = NSSize(width: 1 / s, height: 1 / s)
+        contentResizeIncrements = NSSize(width: 1 / s, height: 1 / s)
     }
 
     @MainActor
     func startCapture(for scDisplay: SCDisplay, on screen: NSScreen, region: CGRect, excludingApplications: [SCRunningApplication]) async {
-        // Convert selection (points) → integer pixels; ScreenCaptureKit uses top-left origin
         let scale = screen.backingScaleFactor
         let x_px = Int(round(region.origin.x * scale))
         let y_px = Int(round((screen.frame.height - region.origin.y - region.height) * scale)) // flip Y
@@ -186,26 +183,22 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
         let h_px = max(16, Int(round(region.height * scale)))
         let pixelRect = CGRect(x: x_px, y: y_px, width: w_px, height: h_px)
 
-        // Pixel-perfect window size (1:1)
         let sizePoints = NSSize(width: CGFloat(w_px) / scale, height: CGFloat(h_px) / scale)
-        self.setContentSize(sizePoints)
-        self.contentAspectRatio = sizePoints
-        self.applyScaleFromCurrentScreen()
+        setContentSize(sizePoints)
+        contentAspectRatio = sizePoints
+        applyScaleFromCurrentScreen()
 
-        // Configure the stream at exact pixel dimensions
         let cfg = SCStreamConfiguration()
-        cfg.width  = w_px
+        cfg.width = w_px
         cfg.height = h_px
         cfg.showsCursor = true
         cfg.sourceRect = pixelRect
         cfg.minimumFrameInterval = CMTime(value: 1, timescale: 30)
         cfg.queueDepth = 5
 
-        let filter = SCContentFilter(display: scDisplay,
-                                     excludingApplications: excludingApplications,
-                                     exceptingWindows: [])
-
+        let filter = SCContentFilter(display: scDisplay, excludingApplications: excludingApplications, exceptingWindows: [])
         let stream = SCStream(filter: filter, configuration: cfg, delegate: self)
+
         do {
             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: .main)
             try await stream.startCapture()
@@ -215,28 +208,49 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
         }
     }
 
-    func stopCapture() {
-        Task { @MainActor in
-            try? await stream?.stopCapture()
-            stream = nil
+    // SCStreamOutput: Handle incoming frames
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
+        guard outputType == .screen, CMSampleBufferIsValid(sampleBuffer), self.stream != nil, !isTearingDown else { return }
+        if displayLayer.isReadyForMoreMediaData {
+            displayLayer.enqueue(sampleBuffer)
         }
     }
 
-    // SCStreamOutput: feed frames (macOS 15 deprecation warnings are OK)
-    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
-        guard outputType == .screen, CMSampleBufferIsValid(sampleBuffer) else { return }
-        if displayLayer.isReadyForMoreMediaData { displayLayer.enqueue(sampleBuffer) }
-    }
-
-    // Surface errors on main
+    // SCStreamDelegate: Handle stream errors
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         Task { @MainActor in
-            self.presenter?.showError("Screen capture stopped: \(error.localizedDescription)")
-            self.stopCapture()
+            presenter?.showError("Screen capture stopped: \(error.localizedDescription)")
+            // Trigger the standard close and cleanup procedure.
+            self.close()
         }
     }
+    
+    // NSWindowDelegate: The primary cleanup hook for the window.
+    func windowWillClose(_ notification: Notification) {
+        // Prevent cleanup logic from running multiple times.
+        if isTearingDown { return }
+        isTearingDown = true
 
-    func windowWillClose(_ notification: Notification) { presenter?.stopCapture() }
+        // Immediately stop rendering.
+        displayLayer.removeFromSuperlayer()
+        displayLayer.flushAndRemoveImage()
+
+        // Safely and asynchronously stop the ScreenCaptureKit stream.
+        // The Task will retain 'self' until the stream has stopped.
+        if let stream = self.stream {
+            Task {
+                do {
+                    try await stream.stopCapture()
+                } catch {
+                    print("Error stopping capture: \(error.localizedDescription)")
+                }
+            }
+            self.stream = nil
+        }
+        
+        // Notify the presenter to update the app state.
+        presenter?.mirrorWindowClosedByUser()
+    }
 }
 
 // MARK: - Presenter (App logic for SwiftUI)
@@ -248,11 +262,8 @@ final class Presenter: ObservableObject {
     private var mirrorWindow: MirrorWindow?
 
     func startSelection() {
-        // NOTE: Do not block on preflight; Ventura/Sonoma/Sequoia may require app relaunch after toggling.
-        // We still request access to trigger the prompt if needed, but continue to selection.
         if !CGPreflightScreenCaptureAccess() {
             _ = CGRequestScreenCaptureAccess()
-            // We do NOT early-return here; proceed and let the stream start surface a precise error if needed.
         }
 
         let targetScreen = NSScreen.screenUnderMouse()
@@ -272,16 +283,14 @@ final class Presenter: ObservableObject {
         Task { @MainActor in
             do {
                 let content = try await SCShareableContent.current
-                // Match SCDisplay to this NSScreen via CGDirectDisplayID.
-                guard let scDisplay = content.displays.first(where: { $0.displayID == screen.displayID }) ?? content.displays.first else {
-                    showError("Could not match the selected display.")
+                guard let scDisplay = content.displays.first(where: { $0.displayID == screen.displayID }) else {
+                    showError("Could not find a matching display to capture.")
                     return
                 }
-                // Try to exclude our own app; if we can’t find it, proceed without exclusions.
+                
                 let myBundleID = Bundle.main.bundleIdentifier
                 let excludedApps = content.applications.filter { $0.bundleIdentifier == myBundleID }
 
-                // Create / show mirror window and start capture.
                 self.mirrorWindow?.close()
                 let mirror = MirrorWindow(contentRect: region, presenter: self)
                 self.mirrorWindow = mirror
@@ -289,20 +298,18 @@ final class Presenter: ObservableObject {
 
                 self.model.isCapturing = true
             } catch {
-                // If this fails with a permission error, guide the user to Settings.
                 showError("""
-                Failed to enumerate displays: \(error.localizedDescription)
-                If you just enabled “Screen & System Audio Recording”, you may need to quit and relaunch the app.
-                You can also open the Settings pane from RegionMirror > Help > Open Screen Recording Settings.
+                Failed to start mirroring: \(error.localizedDescription)
+                If you just enabled Screen Recording permissions, you may need to quit and relaunch RegionMirror.
                 """)
             }
         }
     }
 
     func stopCapture() {
-        mirrorWindow?.stopCapture()
-        mirrorWindow = nil
-        model.isCapturing = false
+        // Programmatically close the window.
+        // Cleanup is handled by the windowWillClose delegate method.
+        mirrorWindow?.close()
     }
 
     func showError(_ message: String) {
@@ -315,7 +322,12 @@ final class Presenter: ObservableObject {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    // Convenience to deep-link to the privacy pane (you can call this from a menu item)
+    // This is called by MirrorWindow's `windowWillClose` delegate method.
+    func mirrorWindowClosedByUser() {
+        mirrorWindow = nil
+        model.isCapturing = false
+    }
+    
     func openScreenRecordingSettings() {
         let candidates = [
             "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
