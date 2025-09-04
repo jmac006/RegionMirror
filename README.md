@@ -5,7 +5,7 @@
 ## Description
 RegionMirror is a small macOS utility that lets you draw a rectangle on your screen and opens a **shareable app window** that mirrors exactly that region. In Microsoft Teams (and other meeting apps) you can then select this RegionMirror window via **Share → Window**, so you only share the focused area instead of your entire display.
 
-Switching to Microsoft Teams was a bit of a challenge after using Zoom. One of the features I missed most was the ability to share only a portion of my screen. Teams doesn’t support that out of the box, so I set out to build a simple macOS utility: RegionMirror. With it, you can draw a rectangle on your screen, and a clean, shareable window appears that mirrors only that region. Perfect for keeping your focus on what matters without oversharing.
+Switching to Microsoft Teams was a bit of a challenge after using Zoom. One of the features I missed most was the ability to share only a portion of my screen. Teams doesn’t support that out of the box, so I set out to build a simple macOS utility: RegionMirror. With it, you can draw a rectangle on your screen, and a clean, shareable window appears that mirrors only that region, perfect for an ultrawide monitor. Perfect for keeping your focus on what matters without oversharing.
 
 Unlike system-level “share portion of screen” features, RegionMirror gives you a real window you can see and position anywhere, making it obvious what your audience is seeing.
 
