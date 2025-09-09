@@ -142,6 +142,7 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
     private var stream: SCStream?
     weak var presenter: Presenter?
     private var isTearingDown = false
+    private var capturePixelSize: CGSize = .zero  // Store the actual capture dimensions
 
     init(contentRect: CGRect, presenter: Presenter) {
         self.presenter = presenter
@@ -160,12 +161,15 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
         contentView!.layer?.masksToBounds = true
         contentView!.layer?.allowsGroupOpacity = false
 
-        // Preview layer
+        // Preview layer - configured for pixel-perfect rendering
         displayLayer.isOpaque = true
-        displayLayer.videoGravity = .resize
+        displayLayer.videoGravity = .resize  // Critical: .resize for exact pixel mapping
         displayLayer.magnificationFilter = .nearest
         displayLayer.minificationFilter = .nearest
         displayLayer.allowsEdgeAntialiasing = false
+        displayLayer.shouldRasterize = false
+        displayLayer.drawsAsynchronously = false  // Force synchronous drawing
+        displayLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)  // Center anchoring
         contentView!.layer?.addSublayer(displayLayer)
 
         // Initial alignment & scale
@@ -175,7 +179,11 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
         contentView?.postsFrameChangedNotifications = true
         NotificationCenter.default.addObserver(forName: NSView.frameDidChangeNotification, object: contentView, queue: .main) { [weak self] _ in
             guard let self = self, let cv = self.contentView else { return }
-            self.displayLayer.frame = cv.backingAlignedRect(cv.bounds, options: .alignAllEdgesNearest)
+            // Maintain pixel-exact layer sizing on resize
+            if self.capturePixelSize != .zero {
+                self.displayLayer.bounds = CGRect(origin: .zero, size: self.capturePixelSize)
+                self.displayLayer.position = CGPoint(x: cv.bounds.midX, y: cv.bounds.midY)
+            }
         }
         // Update scale on screen changes
         NotificationCenter.default.addObserver(forName: NSWindow.didChangeScreenNotification, object: self, queue: .main) { [weak self] _ in
@@ -191,12 +199,25 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
 
     private func applyScaleFromCurrentScreen() {
         let s = (screen?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor) ?? 2.0
+        
+        // Critical: Set contentView layer scale for proper backing store
         contentView?.layer?.contentsScale = s
-        displayLayer.contentsScale = s
-        if let cv = contentView {
-            displayLayer.frame = cv.backingAlignedRect(cv.bounds, options: .alignAllEdgesNearest)
+        
+        // Key insight: Size displayLayer in PIXELS, set contentsScale to 1.0
+        // This forces 1:1 pixel mapping without interpolation
+        displayLayer.contentsScale = 1.0
+        
+        if let cv = contentView, capturePixelSize != .zero {
+            // Size displayLayer bounds to match capture pixel dimensions exactly
+            // This prevents any scaling/interpolation of the video content
+            displayLayer.bounds = CGRect(origin: .zero, size: capturePixelSize)
+            displayLayer.position = CGPoint(x: cv.bounds.midX, y: cv.bounds.midY)
         }
-        contentResizeIncrements = NSSize(width: 1 / s, height: 1 / s)
+        
+        // Ensure minimum resize increments to prevent crashes
+        let minIncrement: CGFloat = 1.0
+        let increment = max(minIncrement, 1 / s)
+        contentResizeIncrements = NSSize(width: increment, height: increment)
     }
 
     @MainActor
@@ -211,11 +232,18 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
         let h_px = max(16, Int(round(region.size.height * sy)))
         let pixelRect = CGRect(x: x_px, y: y_px, width: w_px, height: h_px)
 
-        // Size the content so 1 captured pixel == 1 device pixel on this screen
-        let sizePoints = NSSize(width: CGFloat(w_px) / sx, height: CGFloat(h_px) / sy)
+        // Store the capture pixel dimensions for exact layer sizing
+        self.capturePixelSize = CGSize(width: w_px, height: h_px)
+        
+        // Size the window to the ORIGINAL region size in points
+        let sizePoints = NSSize(width: region.size.width, height: region.size.height)
+        
         self.setContentSize(sizePoints)
         self.contentAspectRatio = sizePoints
-        self.contentResizeIncrements = NSSize(width: 1 / sx, height: 1 / sy)
+        
+        // Set resize increments to maintain pixel boundaries
+        let currentScale = self.screen?.backingScaleFactor ?? 2.0
+        self.contentResizeIncrements = NSSize(width: 1 / currentScale, height: 1 / currentScale)
         self.applyScaleFromCurrentScreen()
 
         let cfg = SCStreamConfiguration()
