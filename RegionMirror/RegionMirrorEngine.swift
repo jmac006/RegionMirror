@@ -263,49 +263,76 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
         
         print("Display info - logical: \(displayMode.width)×\(displayMode.height), physical: \(displayMode.pixelWidth)×\(displayMode.pixelHeight)")
         
-        // 1. Convert region to display-local coordinates (if needed)
-        let displayFrame = screen.frame  // frame in global points
-        var regionPoints = region        // region in global points (from Cocoa)
-        regionPoints.origin.x -= displayFrame.origin.x
-        regionPoints.origin.y -= displayFrame.origin.y
-        
-        // 2. Get precise scale factors from display mode
+        // Determine scale factors from display mode
         let scaleX = CGFloat(displayMode.pixelWidth) / CGFloat(displayMode.width)
         let scaleY = CGFloat(displayMode.pixelHeight) / CGFloat(displayMode.height)
+        let isHiDPI = scaleX > 1.0 || scaleY > 1.0
         
-        print("Precise scale factors - X: \(scaleX), Y: \(scaleY)")
+        print("Scale factors - X: \(scaleX), Y: \(scaleY), HiDPI: \(isHiDPI)")
         
-        // 3. Align region to pixel boundaries using floor/ceil to avoid rounding errors
-        let x0_px = floor(regionPoints.minX * scaleX)
-        let y0_px = floor(regionPoints.minY * scaleY)
-        let x1_px = ceil(regionPoints.maxX * scaleX)
-        let y1_px = ceil(regionPoints.maxY * scaleY)
-        let regionWidth_px  = x1_px - x0_px
-        let regionHeight_px = y1_px - y0_px
+        let w_px: Int
+        let h_px: Int
+        let sourceRect: CGRect
         
-        // Ensure minimum capture dimensions
-        let w_px = max(16, Int(regionWidth_px))
-        let h_px = max(16, Int(regionHeight_px))
-        
-        // 4. Convert to top-left oriented rect in points (DIPs) for ScreenCaptureKit
-        let pixelHeight = CGFloat(displayMode.pixelHeight)
-        let originX_topLeft = x0_px            // from left in px
-        let originY_topLeft = pixelHeight - y1_px  // from top in px
-        let sourceRect = CGRect(
-            x: originX_topLeft / scaleX,
-            y: originY_topLeft / scaleY,
-            width: regionWidth_px / scaleX,
-            height: regionHeight_px / scaleY
-        )
+        if isHiDPI {
+            // RETINA PATH: Use precise pixel boundary alignment for HiDPI displays
+            print("Using HiDPI coordinate mapping for Retina display")
+            
+            // 1. Convert region to display-local coordinates
+            let displayFrame = screen.frame
+            var regionPoints = region
+            regionPoints.origin.x -= displayFrame.origin.x
+            regionPoints.origin.y -= displayFrame.origin.y
+            
+            // 2. Align region to pixel boundaries using floor/ceil to avoid rounding errors
+            let x0_px = floor(regionPoints.minX * scaleX)
+            let y0_px = floor(regionPoints.minY * scaleY)
+            let x1_px = ceil(regionPoints.maxX * scaleX)
+            let y1_px = ceil(regionPoints.maxY * scaleY)
+            let regionWidth_px  = x1_px - x0_px
+            let regionHeight_px = y1_px - y0_px
+            
+            // Ensure minimum capture dimensions
+            w_px = max(16, Int(regionWidth_px))
+            h_px = max(16, Int(regionHeight_px))
+            
+            // 3. Convert to top-left oriented rect in points for ScreenCaptureKit
+            let pixelHeight = CGFloat(displayMode.pixelHeight)
+            let originX_topLeft = x0_px
+            let originY_topLeft = pixelHeight - y1_px
+            sourceRect = CGRect(
+                x: originX_topLeft / scaleX,
+                y: originY_topLeft / scaleY,
+                width: regionWidth_px / scaleX,
+                height: regionHeight_px / scaleY
+            )
+            
+            print("Retina capture config:")
+            print("  - Original region (global): \(region)")
+            print("  - Display-local region: \(regionPoints)")
+            print("  - Pixel boundaries: (\(x0_px), \(y0_px)) to (\(x1_px), \(y1_px))")
+            print("  - Capture size: \(w_px)×\(h_px) pixels")
+            print("  - SourceRect (top-left origin): \(sourceRect)")
+            
+        } else {
+            // ULTRAWIDE/STANDARD PATH: Use simpler coordinate conversion for 1.0 scale displays
+            print("Using standard coordinate mapping for non-HiDPI display")
+            
+            // Use the original, working approach for non-Retina displays
+            let x_px = Int(round(region.origin.x * scaleX))
+            let y_px = Int(round((screen.frame.height - region.origin.y - region.height) * scaleY))
+            w_px = max(16, Int(round(region.size.width * scaleX)))
+            h_px = max(16, Int(round(region.size.height * scaleY)))
+            
+            sourceRect = CGRect(x: x_px, y: y_px, width: w_px, height: h_px)
+            
+            print("Standard capture config:")
+            print("  - Region: \(region)")
+            print("  - Pixels: \(w_px)×\(h_px)")
+            print("  - SourceRect: \(sourceRect)")
+        }
         
         self.capturePixelSize = CGSize(width: w_px, height: h_px)
-        
-        print("Pixel-perfect capture config:")
-        print("  - Original region (global): \(region)")
-        print("  - Display-local region: \(regionPoints)")
-        print("  - Pixel boundaries: (\(x0_px), \(y0_px)) to (\(x1_px), \(y1_px))")
-        print("  - Capture size: \(w_px)×\(h_px) pixels")
-        print("  - SourceRect (top-left origin): \(sourceRect)")
         
         // Size window to original region
         let sizePoints = NSSize(width: region.size.width, height: region.size.height)
