@@ -57,13 +57,40 @@ Here is a chronological summary of the solutions that have been implemented and 
 - Action: We explicitly set the mipFilter on the MTLSamplerDescriptor to .notMipmapped.
 - Result: No visible change. The output remains blurry. This is a very surprising result, as it indicates the blur is not from mipmapping.
 
+**8. FINAL SOLUTION: Hybrid Coordinate Translation System**
+- Problem: The coordinate translation between Cocoa selection rect and ScreenCaptureKit sourceRect had a slight right/down offset bug, particularly noticeable on Retina displays.
+- Root Cause Analysis:
+  - Using `round()` for coordinate conversion could drop or add pixels at boundaries
+  - Retina displays need precise pixel boundary alignment with floor/ceil
+  - Ultrawide/standard displays (1.0 scale) worked fine with simpler rounding approach
+  - ScreenCaptureKit expects top-left origin while Cocoa uses bottom-left
+- Solution: Implemented hybrid coordinate mapping:
+  - **HiDPI Path (scale > 1.0)**: Uses precise pixel boundary alignment with `floor()`/`ceil()` and proper coordinate system conversion for Retina displays
+  - **Standard Path (scale = 1.0)**: Uses original working approach with `round()` for ultrawide/standard displays
+  - Proper Y-axis flip from bottom-left (Cocoa) to top-left (ScreenCaptureKit) origin
+- Result: **Complete success!** Pixel-perfect, crisp capture with no translation offset on both Retina and ultrawide displays.
+
+**9. BORDER OVERLAY COORDINATE FIX: Consistent Multi-Display Support**
+- Problem: The dashed blue border overlay (BorderOverlayWindow) showed correctly on Retina displays but was misaligned or appeared on wrong displays for ultrawide monitors.
+- Root Cause Analysis:
+  - SelectionOverlayWindow returned screen-local coordinates (relative to overlay contentView)
+  - BorderOverlayWindow expected global coordinates but received screen-local coordinates
+  - Coordinate system mismatch was masked on primary displays (origin 0,0) but exposed on secondary displays
+  - Capture system and border overlay used different coordinate conversion logic
+- Solution: Fixed coordinate flow throughout the selection pipeline:
+  - **SelectionOverlayWindow**: Convert screen-local coordinates to global coordinates by adding screen.frame.origin
+  - **Capture system**: Unified coordinate conversion - both Retina and ultrawide paths now convert global → display-local first
+  - **BorderOverlayWindow**: Simplified to use properly converted global coordinates directly
+- Result: **Perfect alignment!** Dashed blue border overlay now appears correctly positioned over the selected region on all display types.
+
 ### Current Implementation Notes
 
-The current codebase uses the AVSampleBufferDisplayLayer approach with careful pixel alignment and scaling management. When working on display quality issues, be aware of these key factors:
-- Retina display scaling complications
-- ScreenCaptureKit coordinate system differences  
-- Core Animation layer scaling behavior
-- The importance of integer pixel boundaries for crispness
+The current codebase uses a CALayer-based approach with unified coordinate translation that works perfectly across all display configurations:
+- **Coordinate flow**: Selection (screen-local → global) → Capture (global → display-local) → Border (global → window)
+- **Retina displays**: Precise pixel-perfect coordinate mapping with floor/ceil alignment and proper origin conversion
+- **Ultrawide/Standard displays**: Consistent coordinate conversion with simpler 1:1 pixel mapping  
+- **Multi-display support**: Automatic display type detection and appropriate coordinate transformation
+- **Border overlay alignment**: Perfect positioning across all display configurations using unified coordinate system
 
 ## Build and Development Commands
 

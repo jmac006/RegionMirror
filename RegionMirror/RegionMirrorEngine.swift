@@ -114,7 +114,14 @@ final class SelectionOverlayWindow: NSWindow {
                           width: abs(sp.x - p.x), height: abs(sp.y - p.y))
         if rect.width > 10 && rect.height > 10 {
             rect = rect.snappedToDevicePixels(scaleX: targetScaleX, scaleY: targetScaleY)
-            onSelectionComplete?(rect)
+            
+            // CRITICAL: Convert from screen-local coordinates to global coordinates
+            // The selection overlay covers the entire screen, so we need to offset by the screen's origin
+            var globalRect = rect
+            globalRect.origin.x += self.frame.origin.x
+            globalRect.origin.y += self.frame.origin.y
+            
+            onSelectionComplete?(globalRect)
         }
         close()
     }
@@ -261,14 +268,12 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
             return
         }
         
-        print("Display info - logical: \(displayMode.width)×\(displayMode.height), physical: \(displayMode.pixelWidth)×\(displayMode.pixelHeight)")
         
         // Determine scale factors from display mode
         let scaleX = CGFloat(displayMode.pixelWidth) / CGFloat(displayMode.width)
         let scaleY = CGFloat(displayMode.pixelHeight) / CGFloat(displayMode.height)
         let isHiDPI = scaleX > 1.0 || scaleY > 1.0
         
-        print("Scale factors - X: \(scaleX), Y: \(scaleY), HiDPI: \(isHiDPI)")
         
         let w_px: Int
         let h_px: Int
@@ -276,7 +281,6 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
         
         if isHiDPI {
             // RETINA PATH: Use precise pixel boundary alignment for HiDPI displays
-            print("Using HiDPI coordinate mapping for Retina display")
             
             // 1. Convert region to display-local coordinates
             let displayFrame = screen.frame
@@ -307,29 +311,24 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
                 height: regionHeight_px / scaleY
             )
             
-            print("Retina capture config:")
-            print("  - Original region (global): \(region)")
-            print("  - Display-local region: \(regionPoints)")
-            print("  - Pixel boundaries: (\(x0_px), \(y0_px)) to (\(x1_px), \(y1_px))")
-            print("  - Capture size: \(w_px)×\(h_px) pixels")
-            print("  - SourceRect (top-left origin): \(sourceRect)")
             
         } else {
-            // ULTRAWIDE/STANDARD PATH: Use simpler coordinate conversion for 1.0 scale displays
-            print("Using standard coordinate mapping for non-HiDPI display")
+            // ULTRAWIDE/STANDARD PATH: Use coordinate conversion for 1.0 scale displays
             
-            // Use the original, working approach for non-Retina displays
-            let x_px = Int(round(region.origin.x * scaleX))
-            let y_px = Int(round((screen.frame.height - region.origin.y - region.height) * scaleY))
-            w_px = max(16, Int(round(region.size.width * scaleX)))
-            h_px = max(16, Int(round(region.size.height * scaleY)))
+            // Convert region to display-local coordinates (same as Retina path)
+            let displayFrame = screen.frame
+            var regionPoints = region
+            regionPoints.origin.x -= displayFrame.origin.x
+            regionPoints.origin.y -= displayFrame.origin.y
+            
+            // For 1.0 scale displays, we can use simpler pixel conversion
+            let x_px = Int(round(regionPoints.origin.x * scaleX))
+            let y_px = Int(round((displayFrame.height - regionPoints.origin.y - regionPoints.height) * scaleY))
+            w_px = max(16, Int(round(regionPoints.size.width * scaleX)))
+            h_px = max(16, Int(round(regionPoints.size.height * scaleY)))
             
             sourceRect = CGRect(x: x_px, y: y_px, width: w_px, height: h_px)
             
-            print("Standard capture config:")
-            print("  - Region: \(region)")
-            print("  - Pixels: \(w_px)×\(h_px)")
-            print("  - SourceRect: \(sourceRect)")
         }
         
         self.capturePixelSize = CGSize(width: w_px, height: h_px)
@@ -366,8 +365,7 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: frameQueue)
             try await stream.startCapture()
             self.stream = stream
-            print("Stream started successfully with \(w_px)×\(h_px) capture resolution")
-        } catch {
+            } catch {
             Task { @MainActor in
                 self.presenter?.showError("Failed to start capture: \(error.localizedDescription)")
             }
@@ -392,18 +390,6 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
         let height = CVPixelBufferGetHeight(pixelBuffer)
         let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
         
-        // Verify pixel-perfect capture dimensions
-        var frameCount = 0
-        frameCount += 1
-        if frameCount == 1 {
-            print("First frame received - buffer: \(width)×\(height), expected: \(Int(capturePixelSize.width))×\(Int(capturePixelSize.height))")
-            
-            // Check frame metadata for scale factor verification
-            if let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]],
-               let attachments = attachmentsArray.first {
-                print("Frame metadata: \(attachments)")
-            }
-        }
         
         guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
         
@@ -460,7 +446,6 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
                     try stream.removeStreamOutput(self, type: .screen)
                     try await stream.stopCapture()
                 } catch {
-                    print("Error during stream teardown: \(error.localizedDescription)")
                 }
             }
             self.stream = nil
@@ -475,7 +460,9 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
 final class BorderOverlayWindow: NSWindow {
     private let borderLayer = CAShapeLayer()
 
-    init(region: CGRect) {
+    init(region: CGRect, on screen: NSScreen) {
+        
+        // The region is now properly converted to global coordinates by SelectionOverlayWindow
         super.init(contentRect: region, styleMask: .borderless, backing: .buffered, defer: false)
         isOpaque = false
         backgroundColor = .clear
@@ -560,7 +547,8 @@ final class Presenter: ObservableObject {
                 self.mirrorWindow = mirror
                 await mirror.startCapture(for: scDisplay, on: screen, region: region, excludingApplications: excludedApps)
 
-                let border = BorderOverlayWindow(region: region)
+                // Create border overlay positioned correctly for the target screen
+                let border = BorderOverlayWindow(region: region, on: screen)
                 self.borderOverlay = border
                 border.orderFront(nil)
 
