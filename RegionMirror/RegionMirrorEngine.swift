@@ -256,21 +256,56 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
     func startCapture(for scDisplay: SCDisplay, on screen: NSScreen, region: CGRect, excludingApplications: [SCRunningApplication]) async {
         // Get exact physical dimensions using Core Graphics directly
         let displayBounds = CGDisplayBounds(scDisplay.displayID)
-        let displayMode = CGDisplayCopyDisplayMode(scDisplay.displayID)!
-        let actualScaleFactor = Int(displayMode.pixelWidth) / Int(displayMode.width)
+        guard let displayMode = CGDisplayCopyDisplayMode(scDisplay.displayID) else {
+            self.presenter?.showError("Could not get display mode for screen capture")
+            return
+        }
         
-        print("Display info - logical: \(displayMode.width)×\(displayMode.height), physical: \(displayMode.pixelWidth)×\(displayMode.pixelHeight), scale: \(actualScaleFactor)")
+        print("Display info - logical: \(displayMode.width)×\(displayMode.height), physical: \(displayMode.pixelWidth)×\(displayMode.pixelHeight)")
         
-        // Convert region to pixels using actual scale factor
-        let x_px = Int(round(region.origin.x * CGFloat(actualScaleFactor)))
-        let y_px = Int(round((screen.frame.height - region.origin.y - region.height) * CGFloat(actualScaleFactor)))
-        let w_px = max(16, Int(round(region.size.width * CGFloat(actualScaleFactor))))
-        let h_px = max(16, Int(round(region.size.height * CGFloat(actualScaleFactor))))
-        let pixelRect = CGRect(x: x_px, y: y_px, width: w_px, height: h_px)
+        // 1. Convert region to display-local coordinates (if needed)
+        let displayFrame = screen.frame  // frame in global points
+        var regionPoints = region        // region in global points (from Cocoa)
+        regionPoints.origin.x -= displayFrame.origin.x
+        regionPoints.origin.y -= displayFrame.origin.y
+        
+        // 2. Get precise scale factors from display mode
+        let scaleX = CGFloat(displayMode.pixelWidth) / CGFloat(displayMode.width)
+        let scaleY = CGFloat(displayMode.pixelHeight) / CGFloat(displayMode.height)
+        
+        print("Precise scale factors - X: \(scaleX), Y: \(scaleY)")
+        
+        // 3. Align region to pixel boundaries using floor/ceil to avoid rounding errors
+        let x0_px = floor(regionPoints.minX * scaleX)
+        let y0_px = floor(regionPoints.minY * scaleY)
+        let x1_px = ceil(regionPoints.maxX * scaleX)
+        let y1_px = ceil(regionPoints.maxY * scaleY)
+        let regionWidth_px  = x1_px - x0_px
+        let regionHeight_px = y1_px - y0_px
+        
+        // Ensure minimum capture dimensions
+        let w_px = max(16, Int(regionWidth_px))
+        let h_px = max(16, Int(regionHeight_px))
+        
+        // 4. Convert to top-left oriented rect in points (DIPs) for ScreenCaptureKit
+        let pixelHeight = CGFloat(displayMode.pixelHeight)
+        let originX_topLeft = x0_px            // from left in px
+        let originY_topLeft = pixelHeight - y1_px  // from top in px
+        let sourceRect = CGRect(
+            x: originX_topLeft / scaleX,
+            y: originY_topLeft / scaleY,
+            width: regionWidth_px / scaleX,
+            height: regionHeight_px / scaleY
+        )
         
         self.capturePixelSize = CGSize(width: w_px, height: h_px)
         
-        print("Capture config - region: \(region), pixels: \(w_px)×\(h_px), sourceRect: \(pixelRect)")
+        print("Pixel-perfect capture config:")
+        print("  - Original region (global): \(region)")
+        print("  - Display-local region: \(regionPoints)")
+        print("  - Pixel boundaries: (\(x0_px), \(y0_px)) to (\(x1_px), \(y1_px))")
+        print("  - Capture size: \(w_px)×\(h_px) pixels")
+        print("  - SourceRect (top-left origin): \(sourceRect)")
         
         // Size window to original region
         let sizePoints = NSSize(width: region.size.width, height: region.size.height)
@@ -285,7 +320,7 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
         cfg.width = w_px
         cfg.height = h_px
         cfg.showsCursor = true
-        cfg.sourceRect = pixelRect
+        cfg.sourceRect = sourceRect
         
         // KEY FIXES from Claude Opus analysis:
         cfg.captureResolution = .best  // Maximum quality
