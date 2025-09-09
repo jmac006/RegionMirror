@@ -138,12 +138,16 @@ final class SelectionOverlayWindow: NSWindow {
 // MARK: - Crisp Shareable Window (ScreenCaptureKit)
 
 final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDelegate {
-    fileprivate let displayLayer = AVSampleBufferDisplayLayer()
+    // Custom layer for pixel-perfect rendering
+    private let imageLayer = CALayer()
     private var stream: SCStream?
     weak var presenter: Presenter?
     private var isTearingDown = false
-    private var capturePixelSize: CGSize = .zero  // Store the actual capture dimensions
-
+    private var capturePixelSize: CGSize = .zero
+    
+    // Queue for frame processing
+    private let frameQueue = DispatchQueue(label: "com.regionmirror.frameprocessing", qos: .userInteractive)
+    
     init(contentRect: CGRect, presenter: Presenter) {
         self.presenter = presenter
         super.init(
@@ -153,124 +157,222 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
             defer: false
         )
         title = "RegionMirror"
-        isReleasedWhenClosed = false // Important: We manage the lifecycle to prevent early release.
+        isReleasedWhenClosed = false
         delegate = self
-
-        // Host layer
+        
+        // Configure content view
         contentView?.wantsLayer = true
         contentView!.layer?.masksToBounds = true
-        contentView!.layer?.allowsGroupOpacity = false
-
-        // Preview layer - configured for pixel-perfect rendering
-        displayLayer.isOpaque = true
-        displayLayer.videoGravity = .resize  // Critical: .resize for exact pixel mapping
-        displayLayer.magnificationFilter = .nearest
-        displayLayer.minificationFilter = .nearest
-        displayLayer.allowsEdgeAntialiasing = false
-        displayLayer.shouldRasterize = false
-        displayLayer.drawsAsynchronously = false  // Force synchronous drawing
-        displayLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)  // Center anchoring
-        contentView!.layer?.addSublayer(displayLayer)
-
-        // Initial alignment & scale
+        
+        // Configure image layer for pixel-perfect rendering
+        imageLayer.magnificationFilter = .nearest
+        imageLayer.minificationFilter = .nearest
+        imageLayer.shouldRasterize = false
+        imageLayer.drawsAsynchronously = false
+        imageLayer.isOpaque = true
+        imageLayer.contentsGravity = .center // Don't stretch content
+        
+        // CRITICAL: Disable all edge antialiasing and interpolation
+        imageLayer.allowsEdgeAntialiasing = false
+        imageLayer.edgeAntialiasingMask = []
+        
+        contentView!.layer?.addSublayer(imageLayer)
+        
+        // Initial setup
         applyScaleFromCurrentScreen()
-
-        // Keep alignment on resize
+        
+        // Handle resize events
         contentView?.postsFrameChangedNotifications = true
-        NotificationCenter.default.addObserver(forName: NSView.frameDidChangeNotification, object: contentView, queue: .main) { [weak self] _ in
-            guard let self = self, let cv = self.contentView else { return }
-            // Maintain pixel-exact layer sizing on resize
-            if self.capturePixelSize != .zero {
-                self.displayLayer.bounds = CGRect(origin: .zero, size: self.capturePixelSize)
-                self.displayLayer.position = CGPoint(x: cv.bounds.midX, y: cv.bounds.midY)
-            }
+        NotificationCenter.default.addObserver(
+            forName: NSView.frameDidChangeNotification,
+            object: contentView,
+            queue: .main
+        ) { [weak self] _ in
+            self?.updateLayerFrame()
         }
-        // Update scale on screen changes
-        NotificationCenter.default.addObserver(forName: NSWindow.didChangeScreenNotification, object: self, queue: .main) { [weak self] _ in
+        
+        // Handle screen changes
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeScreenNotification,
+            object: self,
+            queue: .main
+        ) { [weak self] _ in
             self?.applyScaleFromCurrentScreen()
         }
-        NotificationCenter.default.addObserver(forName: NSWindow.didChangeBackingPropertiesNotification, object: self, queue: .main) { [weak self] _ in
+        
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeBackingPropertiesNotification,
+            object: self,
+            queue: .main
+        ) { [weak self] _ in
             self?.applyScaleFromCurrentScreen()
         }
-
+        
         center()
         makeKeyAndOrderFront(nil)
     }
-
+    
     private func applyScaleFromCurrentScreen() {
-        let s = (screen?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor) ?? 2.0
+        guard let screen = self.screen else { return }
+        let scale = screen.backingScaleFactor
         
-        // Critical: Set contentView layer scale for proper backing store
-        contentView?.layer?.contentsScale = s
+        // Set the content view's layer scale
+        contentView?.layer?.contentsScale = scale
         
-        // Key insight: Size displayLayer in PIXELS, set contentsScale to 1.0
-        // This forces 1:1 pixel mapping without interpolation
-        displayLayer.contentsScale = 1.0
+        // CRITICAL: Set imageLayer's contentsScale to match the screen
+        // This ensures the CGImage is rendered at the correct resolution
+        imageLayer.contentsScale = scale
         
-        if let cv = contentView, capturePixelSize != .zero {
-            // Size displayLayer bounds to match capture pixel dimensions exactly
-            // This prevents any scaling/interpolation of the video content
-            displayLayer.bounds = CGRect(origin: .zero, size: capturePixelSize)
-            displayLayer.position = CGPoint(x: cv.bounds.midX, y: cv.bounds.midY)
+        // Update resize increments
+        contentResizeIncrements = NSSize(width: 1.0 / scale, height: 1.0 / scale)
+        
+        updateLayerFrame()
+    }
+    
+    private func updateLayerFrame() {
+        guard let contentView = self.contentView else { return }
+        
+        if capturePixelSize != .zero {
+            // Get current screen scale
+            let scale = self.screen?.backingScaleFactor ?? 2.0
+            
+            // Calculate the size in points that matches our pixel size
+            let sizeInPoints = CGSize(
+                width: capturePixelSize.width / scale,
+                height: capturePixelSize.height / scale
+            )
+            
+            // Center the layer in the content view
+            let x = (contentView.bounds.width - sizeInPoints.width) / 2
+            let y = (contentView.bounds.height - sizeInPoints.height) / 2
+            
+            imageLayer.frame = CGRect(origin: CGPoint(x: x, y: y), size: sizeInPoints)
+        } else {
+            imageLayer.frame = contentView.bounds
         }
-        
-        // Ensure minimum resize increments to prevent crashes
-        let minIncrement: CGFloat = 1.0
-        let increment = max(minIncrement, 1 / s)
-        contentResizeIncrements = NSSize(width: increment, height: increment)
     }
 
     @MainActor
     func startCapture(for scDisplay: SCDisplay, on screen: NSScreen, region: CGRect, excludingApplications: [SCRunningApplication]) async {
-        let (sx, sy) = screen.pixelScale
-
-        // Convert the selection (points) to integer pixels relative to the display,
-        // flipping Y because ScreenCaptureKit uses a top-left origin in pixel space.
-        let x_px = Int(round(region.origin.x * sx))
-        let y_px = Int(round((screen.frame.height - region.origin.y - region.height) * sy))
-        let w_px = max(16, Int(round(region.size.width * sx)))
-        let h_px = max(16, Int(round(region.size.height * sy)))
+        // Get exact physical dimensions using Core Graphics directly
+        let displayBounds = CGDisplayBounds(scDisplay.displayID)
+        let displayMode = CGDisplayCopyDisplayMode(scDisplay.displayID)!
+        let actualScaleFactor = Int(displayMode.pixelWidth) / Int(displayMode.width)
+        
+        print("Display info - logical: \(displayMode.width)×\(displayMode.height), physical: \(displayMode.pixelWidth)×\(displayMode.pixelHeight), scale: \(actualScaleFactor)")
+        
+        // Convert region to pixels using actual scale factor
+        let x_px = Int(round(region.origin.x * CGFloat(actualScaleFactor)))
+        let y_px = Int(round((screen.frame.height - region.origin.y - region.height) * CGFloat(actualScaleFactor)))
+        let w_px = max(16, Int(round(region.size.width * CGFloat(actualScaleFactor))))
+        let h_px = max(16, Int(round(region.size.height * CGFloat(actualScaleFactor))))
         let pixelRect = CGRect(x: x_px, y: y_px, width: w_px, height: h_px)
-
-        // Store the capture pixel dimensions for exact layer sizing
+        
         self.capturePixelSize = CGSize(width: w_px, height: h_px)
         
-        // Size the window to the ORIGINAL region size in points
-        let sizePoints = NSSize(width: region.size.width, height: region.size.height)
+        print("Capture config - region: \(region), pixels: \(w_px)×\(h_px), sourceRect: \(pixelRect)")
         
+        // Size window to original region
+        let sizePoints = NSSize(width: region.size.width, height: region.size.height)
         self.setContentSize(sizePoints)
         self.contentAspectRatio = sizePoints
         
-        // Set resize increments to maintain pixel boundaries
-        let currentScale = self.screen?.backingScaleFactor ?? 2.0
-        self.contentResizeIncrements = NSSize(width: 1 / currentScale, height: 1 / currentScale)
-        self.applyScaleFromCurrentScreen()
-
+        // Update layer positioning
+        updateLayerFrame()
+        
+        // CRITICAL: Configure stream for pixel-perfect capture
         let cfg = SCStreamConfiguration()
-        cfg.width  = w_px
+        cfg.width = w_px
         cfg.height = h_px
         cfg.showsCursor = true
         cfg.sourceRect = pixelRect
-        cfg.minimumFrameInterval = CMTime(value: 1, timescale: 30)
-        cfg.queueDepth = 5
-
+        
+        // KEY FIXES from Claude Opus analysis:
+        cfg.captureResolution = .best  // Maximum quality
+        cfg.scalesToFit = false  // CRITICAL: prevents automatic scaling
+        cfg.preservesAspectRatio = true
+        cfg.pixelFormat = kCVPixelFormatType_32BGRA  // Maximum quality
+        
+        cfg.minimumFrameInterval = CMTime(value: 1, timescale: 60)  // 60 FPS
+        cfg.queueDepth = 5  // Optimal for real-time capture
+        
         let filter = SCContentFilter(display: scDisplay, excludingApplications: excludingApplications, exceptingWindows: [])
         let stream = SCStream(filter: filter, configuration: cfg, delegate: self)
-
+        
         do {
-            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: .main)
+            // Use background queue for frame processing
+            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: frameQueue)
             try await stream.startCapture()
             self.stream = stream
+            print("Stream started successfully with \(w_px)×\(h_px) capture resolution")
         } catch {
-            Task { @MainActor in self.presenter?.showError("Failed to start capture: \(error.localizedDescription)") }
+            Task { @MainActor in
+                self.presenter?.showError("Failed to start capture: \(error.localizedDescription)")
+            }
         }
     }
 
-    // SCStreamOutput: Handle incoming frames
+    // SCStreamOutput: Convert CMSampleBuffer to CGImage for pixel-perfect rendering
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
-        guard outputType == .screen, !isTearingDown, CMSampleBufferIsValid(sampleBuffer), self.stream != nil else { return }
-        if displayLayer.isReadyForMoreMediaData {
-            displayLayer.enqueue(sampleBuffer)
+        guard outputType == .screen,
+              !isTearingDown,
+              CMSampleBufferIsValid(sampleBuffer),
+              self.stream != nil else { return }
+        
+        // Extract CVPixelBuffer
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        
+        // Lock the pixel buffer
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        
+        // Verify pixel-perfect capture dimensions
+        var frameCount = 0
+        frameCount += 1
+        if frameCount == 1 {
+            print("First frame received - buffer: \(width)×\(height), expected: \(Int(capturePixelSize.width))×\(Int(capturePixelSize.height))")
+            
+            // Check frame metadata for scale factor verification
+            if let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]],
+               let attachments = attachmentsArray.first {
+                print("Frame metadata: \(attachments)")
+            }
+        }
+        
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+        
+        // Create CGImage directly from pixel buffer
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+        
+        guard let context = CGContext(
+            data: baseAddress,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo.rawValue
+        ) else { return }
+        
+        guard let cgImage = context.makeImage() else { return }
+        
+        // Update layer on main thread
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, !self.isTearingDown else { return }
+            
+            // CRITICAL: Disable implicit animations for immediate update
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            
+            // Set the image directly - CALayer will handle proper scaling
+            self.imageLayer.contents = cgImage
+            
+            CATransaction.commit()
         }
     }
 
@@ -282,20 +384,18 @@ final class MirrorWindow: NSWindow, SCStreamOutput, SCStreamDelegate, NSWindowDe
         }
     }
     
-    // NSWindowDelegate: The primary cleanup hook for the window.
+    // NSWindowDelegate
     func windowWillClose(_ notification: Notification) {
         if isTearingDown { return }
         isTearingDown = true
-
-        displayLayer.flushAndRemoveImage()
-        displayLayer.removeFromSuperlayer()
-
+        
+        imageLayer.contents = nil
+        imageLayer.removeFromSuperlayer()
+        
         if let stream = self.stream {
             Task {
                 do {
-                    // **FIX 2**: First, remove self as an output to stop receiving frames immediately.
                     try stream.removeStreamOutput(self, type: .screen)
-                    // Then, asynchronously stop the capture process.
                     try await stream.stopCapture()
                 } catch {
                     print("Error during stream teardown: \(error.localizedDescription)")
